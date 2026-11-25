@@ -5578,6 +5578,39 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            // A descriptor the program picks from the view heap at an index
+            // it computes: its own words from the host's table of them by
+            // slot. The record count and the format and type are the two a
+            // title reads to choose a path; the rest stop the program.
+            if count <= 8
+                && let Some(a) = self.scalar.get(&site).copied()
+                && a.offset == 0
+            {
+                let mut served = false;
+                for k in 0..count {
+                    let reg = Reg::S(code + k as u8);
+                    let v = if k < super::shader::SLOT_VIEW_WORDS_LEN {
+                        self.heap_view_word(site, k)?
+                    } else {
+                        None
+                    };
+                    match v {
+                        Some(v) => {
+                            served = true;
+                            self.write(inst, reg, v, None);
+                        }
+                        None => {
+                            if let Some(v) = inst.write(reg) {
+                                self.vals.insert(v, Val::Missing(OTHER));
+                                self.stale.insert(v);
+                            }
+                        }
+                    }
+                }
+                if served {
+                    return Ok(());
+                }
+            }
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
@@ -6342,6 +6375,52 @@ impl<'a> Lower<'a> {
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+    }
+
+    /// Dword `k` of the console descriptor of the buffer view the scalar
+    /// load at `load` reads, when the program picks it from the view heap at
+    /// an index it computes: read from the host's table of descriptor words
+    /// by heap slot ([`super::shader::SLOT_VIEW_WORDS`]) in the current
+    /// block. `None` for a load that is not from the heap.
+    fn heap_view_word(&mut self, load: Site, k: u32) -> Result<Option<V>, Why> {
+        let Some(a) = self.scalar.get(&load).copied() else {
+            return Ok(None);
+        };
+        let heap = self
+            .x
+            .native
+            .layout
+            .get(a.param)
+            .is_some_and(|p| p.root == RootType::ResourceHeap);
+        if !heap {
+            return Ok(None);
+        }
+        let c = self.cur;
+        let slot = self.heap_index(load, 0, false)?;
+        // Inside the table whatever the index: a root view has no bounds of
+        // its own.
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let four = self.s.m.i32(4);
+        let at = self.s.m.bin(c, Bin::Shl, slot, four);
+        let word = self.s.m.i32(4 * k);
+        let byte = self.s.m.bin(c, Bin::Add, at, word);
+        let h = self.s.root_srv_handle(super::shader::SLOT_VIEW_WORDS);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let f = self.s.m.extract(c, r, 0);
+        Ok(Some(self.as_int(f)))
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {

@@ -54,6 +54,12 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: four dwords per title slot holding a buffer view's own
+    /// console descriptor words (the address, the record count, and the
+    /// format and type), for programs that read a descriptor they pick from
+    /// the heap as numbers (`victory_shader::emit::SLOT_VIEW_WORDS`): an
+    /// upload buffer of four dwords a slot, its GPU address and its mapping.
+    words: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -619,6 +625,21 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let words = (!sampler)
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT)
+                    * u64::from(victory_shader::emit::SLOT_VIEW_WORDS_LEN)
+                    * 4;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "descriptor words by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let h = HostHeap {
             heap,
             cpu,
@@ -632,6 +653,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            words,
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -783,6 +805,17 @@ impl HostHeap {
     /// The table's buffer, for a list to hold.
     pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|s| &s.0)
+    }
+
+    /// The GPU address of the table of descriptor words by title slot (view
+    /// heaps only).
+    pub(crate) fn words_gpu(&self) -> Option<u64> {
+        self.words.as_ref().map(|s| s.1)
+    }
+
+    /// The table's buffer, for a list to hold.
+    pub(crate) fn words_buffer(&self) -> Option<&ID3D12Resource> {
+        self.words.as_ref().map(|s| &s.0)
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -1042,6 +1075,34 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+        }
+        if let Some((_, _, data)) = &self.words
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // The title's own descriptor words, for programs that read one
+            // as numbers: the buffer's address, its record count, and its
+            // format and type. Zeros for anything that is not a buffer view.
+            let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
+            let words = match view {
+                Some(View::Shader(_, Some(d))) => Some(*d),
+                Some(View::Unordered(_, _, Some(d))) => Some(*d),
+                Some(View::Placed(_, resource, d)) if resource[0] == 1 => {
+                    d[..10].try_into().ok()
+                }
+                _ => None,
+            };
+            let table = [
+                address as u32,
+                (address >> 32) as u32,
+                words.map_or(0, |w| w[2]),
+                words.map_or(0, |w| w[3]),
+            ];
+            // SAFETY: inside the mapping, four dwords a slot; shaders read
+            // it while we write (either value is one the slot had).
+            unsafe {
+                ((*data as *mut u32).add(index as usize * 4) as *mut [u32; 4])
+                    .write_unaligned(table)
+            };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {

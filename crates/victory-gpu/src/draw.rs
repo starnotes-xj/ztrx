@@ -736,6 +736,27 @@ impl State {
         crate::memory::ready(list, heap, &addresses, &constants, writes)
     }
 
+    /// The table of view heap descriptor words
+    /// (`victory_shader::emit::SLOT_VIEW_WORDS`): its GPU address.
+    fn heap_words(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.words_gpu()?;
+        // One key per list, as textures have: no title resource is there.
+        const ONCE: usize = usize::MAX - 0x5d;
+        if list.first_use(ONCE)
+            && let Some(buffer) = host.words_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -956,6 +977,34 @@ impl State {
                                     l.SetComputeRootShaderResourceView(param, m.directory);
                                 } else {
                                     l.SetGraphicsRootShaderResourceView(param, m.directory);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_WORDS {
+                        // Ours, not the title's: the descriptor words of the
+                        // views a shader picks from the heap by index.
+                        match self.heap_words(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => {
+                                // No table: a null view reads zeros, as a
+                                // slot without a buffer view does.
+                                once!("a shader reads view heap descriptor words with no table");
+                                unsafe {
+                                    if compute {
+                                        l.SetComputeRootShaderResourceView(param, 0);
+                                    } else {
+                                        l.SetGraphicsRootShaderResourceView(param, 0);
+                                    }
                                 }
                             }
                         }
