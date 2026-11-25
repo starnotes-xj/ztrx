@@ -306,6 +306,12 @@ fn no_wait() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
 }
 
+/// A decoded video frame or another full-screen image the title updates every frame. Its
+/// writes may not reach the write watch, so it has to be checked each time it is sampled.
+fn full_frame_texture(width: u32, height: u32, mips: u32) -> bool {
+    mips == 1 && width >= 1280 && height >= 720
+}
+
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
 /// through the kernel because title memory was being remapped, and those
 /// left for the next refresh because a page was not there.
@@ -654,7 +660,14 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if unwritten
+                && !turn
+                && !full_frame_texture(
+                    self.layout.desc.width,
+                    self.layout.desc.height,
+                    self.layout.desc.mips,
+                )
+            {
                 return 0;
             }
         }
@@ -1057,7 +1070,15 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::with_title;
+    use super::{full_frame_texture, with_title};
+
+    #[test]
+    fn full_frame_textures_are_checked_every_time() {
+        assert!(full_frame_texture(3840, 2160, 1));
+        assert!(full_frame_texture(1920, 1080, 1));
+        assert!(!full_frame_texture(1920, 1080, 2), "a mip chain is not a video frame");
+        assert!(!full_frame_texture(1024, 768, 1));
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
